@@ -5,15 +5,16 @@
 The PR review problem is split by *concern*, not by file:
 
 1. Fetch PR diff (Orchestrator)
-2. For each changed file, run 4 independent analyses in parallel-conceptually
-   (sequential in this implementation for simplicity/logging, but each agent
-   is stateless per file and could be parallelized with `asyncio` or threads):
+2. For each changed file, run 4 independent analyses (sequential in this
+   implementation for simplicity/logging, but each agent is stateless per
+   file and could be parallelized with `asyncio` or threads):
    - Bug detection
    - Refactor suggestions
    - Style checking (grounded by pylint)
    - Security auditing (grounded by bandit)
 3. Aggregate all findings into one report (Aggregator)
-4. Post back to GitHub (optional)
+4. Generate improved source code with all issues fixed (Code Fixer)
+5. Post report back to GitHub (optional)
 
 ## 2. Agent Roles & Responsibilities
 
@@ -25,6 +26,7 @@ The PR review problem is split by *concern*, not by file:
 | Style Checker | Naming, formatting, convention violations | pylint output + code | `Finding[]` |
 | Security Auditor | Injection risks, secrets, unsafe calls | bandit output + code | `Finding[]` |
 | Aggregator | Dedupe, rank by severity, write executive summary | All `Finding[]` | Markdown report |
+| Code Fixer | Rewrite file with all findings resolved | Full file + all `Finding[]` | Corrected source file |
 
 ## 3. Communication Design
 
@@ -33,16 +35,20 @@ The PR review problem is split by *concern*, not by file:
   the system easy to trace/debug/log — every message has one sender, one
   receiver.
 - **Shared state object:** `PipelineState` (see `src/schemas.py`) is passed
-  through the whole run and accumulates `Finding` objects. This is the
-  system's "blackboard."
-- **Message schema:** every agent, regardless of role, emits a list of
-  `Finding` JSON objects with the same shape:
+  through the whole run and accumulates `Finding` objects and `fixed_files`.
+  This is the system's "blackboard."
+- **Message schema:** every review agent emits a list of `Finding` JSON
+  objects with the same shape:
   ```json
   {"agent": "security_auditor", "file": "auth.py", "line": 42,
    "severity": "high", "issue": "...", "suggestion": "...", "category": "security"}
   ```
-  Standardizing this schema is what lets the Aggregator merge findings from
-  four differently-prompted agents without special-casing each one.
+  Standardizing this schema is what lets the Aggregator and Code Fixer
+  consume findings from four differently-prompted agents without
+  special-casing each one.
+- **Code Fixer input:** after all four review agents finish for a file, the
+  Code Fixer receives the original source code plus the full flat list of
+  findings and rewrites the entire file in one LLM call.
 - **Traceability:** every LLM prompt and response is logged to
   `logs/trace_<repo>_<pr>.jsonl`, giving a full audit trail of the
   "conversation" between the orchestrator and each agent.
@@ -61,18 +67,28 @@ evaluate (precision/recall against known static-tool ground truth).
 
 | Tool | Purpose |
 |---|---|
-| Groq API (Llama 3.3 70B, free tier) | All four review agents + aggregator summary |
+| Groq API (`openai/gpt-oss-20b`) | All review agents + aggregator summary + code fixer |
 | PyGithub | Fetch PR diffs, post review comment |
-| pylint | Deterministic style/lint grounding |
-| bandit | Deterministic security grounding |
+| pylint | Deterministic style/lint grounding for Style Checker |
+| bandit | Deterministic security grounding for Security Auditor |
 | GitHub Actions | Auto-trigger review on PR open/update |
 
-## 6. Known Limitations / Future Work
+## 6. Output Artifacts
+
+| Artifact | Location | Description |
+|---|---|---|
+| Review report | `reports/report_<repo>_<pr>.md` | Executive summary + per-file findings table |
+| Improved code | `fixed/<filename>` | Full rewrite of each reviewed file with all issues resolved |
+| Agent trace | `logs/trace_<repo>_<pr>.jsonl` | JSONL log of every prompt and LLM response |
+
+## 7. Known Limitations / Future Work
 
 - Workers run sequentially per file; could parallelize with `asyncio.gather`
-  for latency, at the cost of harder-to-read logs.
+  for lower latency, at the cost of harder-to-read logs.
 - Only Python is grounded with static tools; other languages fall back to
   pure LLM judgment for style/security.
-- Line numbers from the LLM (bug/refactor agents) are best-effort, not
-  guaranteed accurate against the diff hunk headers — a stretch goal is to
-  parse unified diff `@@` headers and pass exact line ranges to the prompt.
+- Line numbers from the LLM (bug/refactor agents) are best-effort — a stretch
+  goal is to parse unified diff `@@` headers and pass exact line ranges to
+  the prompt for higher accuracy.
+- The Code Fixer rewrites the whole file in one shot; for very large files
+  a chunked approach would be needed to stay within model context limits.
